@@ -1,4 +1,4 @@
-name: wound_app
+name: hera
 description: 邊緣運算傷口辨識系統 - App 端
 publish_to: "none"
 version: 0.1.0
