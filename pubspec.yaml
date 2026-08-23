@@ -1,0 +1,49 @@
+name: wound_app
+description: 邊緣運算傷口辨識系統 - App 端
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # 拍照 / 相機串流
+  camera: ^0.11.0
+
+  # YOLOv8 分割模型推論 (Ultralytics 官方 Flutter 套件)
+  ultralytics_yolo: ^0.1.14
+
+  # 純 Dart 影像處理，用於 HSV 組織分析（不需要 OpenCV）
+  image: ^4.2.0
+
+  # 本地資料庫，儲存傷口檔案 / 歷史紀錄（純 SQL，不需要額外的 code generation 步驟）
+  sqflite: ^2.4.1
+  path_provider: ^2.1.4
+  path: ^1.9.0
+
+  # 簡單的本機設定值（使用者顯示名稱、通知開關等）
+  shared_preferences: ^2.3.2
+
+  # 趨勢折線圖
+  fl_chart: ^0.69.0
+
+  # 等寬字體，用於呈現面積/百分比等量測數字（儀器讀數感）
+  google_fonts: ^6.2.1
+
+  # 就醫提醒推播
+  flutter_local_notifications: ^17.2.2
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/

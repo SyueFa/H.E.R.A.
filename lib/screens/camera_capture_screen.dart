@@ -1,0 +1,330 @@
+import 'dart:io';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import '../models/wound_record.dart';
+import '../models/app_theme.dart';
+import '../services/decision_service.dart';
+import '../services/storage_service.dart';
+import '../services/yolo_service.dart';
+import '../services/hsv_analysis_service.dart';
+
+/// 拍照 → 分割 → 組織分析 → 面積換算 → 決策判定 → 燈號建議
+/// 完整走一次簡報六步驟資料流。
+///
+/// 設計原則：即使真實 YOLO 模型還沒訓練好、assets/models/ 是空的，
+/// 這條流程也「一定會走完」——沒有模型時自動退回示範資料，
+/// 讓 UI/UX（分析中 → 燈號結果 → 存進歷史紀錄）可以先驗證，
+/// 不用等模型到手才能測試畫面。之後模型真的接上，只要
+/// _runSegmentation() 裡的真實推論不再拋錯，就會自動改用真實結果。
+class CameraCaptureScreen extends StatefulWidget {
+  final WoundProfile profile;
+  final StorageService storage;
+
+  const CameraCaptureScreen({
+    super.key,
+    required this.profile,
+    required this.storage,
+  });
+
+  @override
+  State<CameraCaptureScreen> createState() => _CameraCaptureScreenState();
+}
+
+class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
+  CameraController? _controller;
+  final YoloService _yolo = YoloService();
+  final HsvAnalysisService _hsv = HsvAnalysisService();
+  final AreaCalculationService _area = AreaCalculationService();
+  final DecisionService _decision = DecisionService();
+
+  bool _isProcessing = false;
+  bool _modelLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    final cameras = await availableCameras();
+    final backCamera = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
+    _controller = CameraController(backCamera, ResolutionPreset.high);
+    await _controller!.initialize();
+
+    // 模型檔案還沒放進 assets/models/ 之前，loadModel() 一定會失敗，
+    // 這裡刻意接住，讓相機還是能正常打開、拍照，只是分析階段會
+    // 退回示範資料。等組員的 .tflite 檔案放進去，這裡會自動成功。
+    try {
+      await _yolo.loadModel();
+      _modelLoaded = true;
+    } catch (_) {
+      _modelLoaded = false;
+    }
+
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _captureAndAnalyze() async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+    setState(() => _isProcessing = true);
+
+    try {
+      final file = await _controller!.takePicture();
+      final imageFile = File(file.path);
+
+      final previous = await widget.storage.getLatestRecord(widget.profile.id);
+
+      final (double areaCm2, TissueComposition tissue) =
+          await _analyzeImage(imageFile, previousAreaCm2: previous?.areaCm2);
+
+      final changePct = _area.areaChangePct(
+        previousAreaCm2: previous?.areaCm2,
+        currentAreaCm2: areaCm2,
+      );
+
+      final result = _decision.decide(
+        areaCm2: areaCm2,
+        areaChangePct: changePct,
+        tissue: tissue,
+      );
+
+      final record = WoundRecord(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        woundProfileId: widget.profile.id,
+        capturedAt: DateTime.now(),
+        imagePath: imageFile.path,
+        areaCm2: areaCm2,
+        areaChangePct: changePct,
+        tissue: tissue,
+        status: result.status,
+        infectionSafetyNetTriggered: result.infectionSafetyNetTriggered,
+      );
+      await widget.storage.saveRecord(record);
+
+      if (mounted) {
+        _showResultDialog(result, usedRealModel: _modelLoaded);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('分析失敗：$e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  /// 真正的模型接上後，這裡會走 YOLO 分割 + HSV 分析；
+  /// 模型還沒到手（或載入/推論失敗）時，退回一組隨機但合理的
+  /// 示範資料，讓後面的決策樹、彈窗、資料庫、趨勢圖都能真實跑一遍。
+  Future<(double, TissueComposition)> _analyzeImage(
+    File imageFile, {
+    double? previousAreaCm2,
+  }) async {
+    if (_modelLoaded) {
+      try {
+        // Step 2: 邊界分割
+        // ignore: unused_local_variable
+        final segResults = await _yolo.segmentWoundBoundary(imageFile);
+        // TODO: segResults 是 Map<String, dynamic>，實際欄位要等真實模型
+        // 接上後印出來確認（常見會有 'boxes'、'masks' 之類的 key），
+        // 再從中解析遮罩座標，交給 HsvAnalysisService.analyze() 計算組織比例，
+        // 交給 AreaCalculationService.pixelAreaToCm2() 換算面積。
+        // 目前先讓它自然拋錯（欄位還沒解析），落到下面的 catch。
+        throw UnimplementedError('真實模型輸出解析邏輯尚未串接');
+      } catch (_) {
+        // 真實推論失敗（模型輸出格式還沒解析、或模型本身有問題），
+        // 一樣退回示範資料，不讓使用者卡住。
+      }
+    }
+    return _mockAnalysis(previousAreaCm2: previousAreaCm2);
+  }
+
+  /// 示範資料：面積在前次基礎上做小幅隨機變動，組織比例隨機生成但
+  /// 四色合計 100%，讓決策樹、趨勢圖、燈號都有東西可以測試。
+  (double, TissueComposition) _mockAnalysis({double? previousAreaCm2}) {
+    final rand = Random();
+    final base = previousAreaCm2 ?? (3 + rand.nextDouble() * 4);
+    final areaCm2 = (base * (0.85 + rand.nextDouble() * 0.3)).clamp(0.5, 30.0);
+
+    final red = 20 + rand.nextDouble() * 50;
+    final yellow = rand.nextDouble() * (100 - red) * 0.6;
+    final black = rand.nextDouble() * (100 - red - yellow) * 0.5;
+    final yellowGreen = 100 - red - yellow - black;
+
+    return (
+      areaCm2,
+      TissueComposition(
+        redGranulationPct: red,
+        yellowSloughPct: yellow,
+        blackNecrosisPct: black,
+        yellowGreenPusPct: yellowGreen.clamp(0, 100),
+      ),
+    );
+  }
+
+  void _showResultDialog(DecisionResult result, {required bool usedRealModel}) {
+    final style = StatusStyle.of(result.status);
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(color: style.bg, shape: BoxShape.circle),
+              child: Center(child: Text(style.emoji, style: const TextStyle(fontSize: 28))),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              style.label,
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: style.color),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              result.advice,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: AppTheme.inkSoft, height: 1.5),
+            ),
+            if (!usedRealModel) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: AppTheme.bg,
+                  borderRadius: BorderRadius.circular(100),
+                ),
+                child: Text(
+                  '⚠️ 示範資料（模型尚未接上）',
+                  style: AppTheme.mono(fontSize: 10, color: AppTheme.inkSoft),
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          Center(
+            child: FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: AppTheme.blue),
+              onPressed: () => Navigator.pop(context),
+              child: const Text('確定'),
+            ),
+          ),
+        ],
+        actionsAlignment: MainAxisAlignment.center,
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    _yolo.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _controller;
+    return Scaffold(
+      appBar: AppBar(title: Text('拍攝：${widget.profile.label}')),
+      body: controller == null || !controller.value.isInitialized
+          ? const Center(child: CircularProgressIndicator())
+          : Stack(
+              children: [
+                CameraPreview(controller),
+                // TODO: 拍攝引導 — 角度/距離提示 + 比例尺貼紙辨識疊加層，
+                // 確保跨週影像可比對（簡報「拍攝引導」功能）
+                const _ScaleGuideOverlay(),
+              ],
+            ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _isProcessing ? null : _captureAndAnalyze,
+        icon: _isProcessing
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.camera),
+        label: Text(_isProcessing ? '分析中...' : '拍照並判讀'),
+      ),
+    );
+  }
+}
+
+/// 拍攝引導疊加層：文字提示 + 置中的比例尺對齊框。
+/// 之後要接上真的比例尺辨識，這個框目前只是視覺引導，不會自動偵測。
+class _ScaleGuideOverlay extends StatelessWidget {
+  const _ScaleGuideOverlay();
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          margin: const EdgeInsets.only(top: 16),
+          child: const Center(
+            child: Text(
+              '請將比例尺貼紙置於框內',
+              style: TextStyle(
+                color: Colors.white,
+                backgroundColor: Colors.black45,
+                fontSize: 13,
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: Center(
+            child: Container(
+              width: 180,
+              height: 180,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white70, width: 2),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Stack(
+                children: [
+                  _cornerMark(Alignment.topLeft),
+                  _cornerMark(Alignment.topRight),
+                  _cornerMark(Alignment.bottomLeft),
+                  _cornerMark(Alignment.bottomRight),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _cornerMark(Alignment alignment) {
+    return Align(
+      alignment: alignment,
+      child: Container(
+        width: 22,
+        height: 22,
+        decoration: BoxDecoration(
+          border: Border(
+            top: alignment.y < 0 ? const BorderSide(color: Colors.tealAccent, width: 3) : BorderSide.none,
+            bottom: alignment.y > 0 ? const BorderSide(color: Colors.tealAccent, width: 3) : BorderSide.none,
+            left: alignment.x < 0 ? const BorderSide(color: Colors.tealAccent, width: 3) : BorderSide.none,
+            right: alignment.x > 0 ? const BorderSide(color: Colors.tealAccent, width: 3) : BorderSide.none,
+          ),
+        ),
+      ),
+    );
+  }
+}

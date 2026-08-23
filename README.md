@@ -84,7 +84,7 @@ flowchart LR
 | 決策邏輯 | Rule-based Logic，參考 PUSH Tool 設計 |
 | App 開發 | **Flutter**（`camera` + `ultralytics_yolo` 套件） |
 | 本地儲存 | SQLite（Flutter 端透過 `sqflite`） |
-| 訓練環境 | Google Colab GPU |
+| 訓練環境 | 本機顯卡（NVIDIA RTX 5090，備援環境 RTX 5070） |
 
 > ⚠️ **感染安全網現況**：架構圖中的「感染安全網」目前**尚未訓練 DFUC2021
 > 分類器**，是用規則判斷暫代（絕對面積 > 門檻值 或 偵測到黃綠膿液即觸發），
