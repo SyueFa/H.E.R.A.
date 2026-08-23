@@ -34,6 +34,11 @@ class CameraCaptureScreen extends StatefulWidget {
 class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   CameraController? _controller;
   final YoloService _yolo = YoloService();
+
+  // 目前 _analyzeImage() 裡真實模型分支還在 throw UnimplementedError，
+  // 尚未走到呼叫 _hsv.analyze() 那一步，所以這個欄位暫時沒被使用。
+  // 等模型輸出解析邏輯接上、能真的餵給 HSV 分析後就會用到，先保留。
+  // ignore: unused_field
   final HsvAnalysisService _hsv = HsvAnalysisService();
   final AreaCalculationService _area = AreaCalculationService();
   final DecisionService _decision = DecisionService();
@@ -107,7 +112,12 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
       await widget.storage.saveRecord(record);
 
       if (mounted) {
-        _showResultDialog(result, usedRealModel: _modelLoaded);
+        _showResultDialog(
+          result,
+          areaCm2: areaCm2,
+          tissue: tissue,
+          usedRealModel: _modelLoaded,
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -169,7 +179,12 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     );
   }
 
-  void _showResultDialog(DecisionResult result, {required bool usedRealModel}) {
+  void _showResultDialog(
+    DecisionResult result, {
+    required double areaCm2,
+    required TissueComposition tissue,
+    required bool usedRealModel,
+  }) {
     final style = StatusStyle.of(result.status);
     showDialog(
       context: context,
@@ -193,8 +208,44 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
             Text(
               result.advice,
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 12, color: AppTheme.inkSoft, height: 1.5),
+              style: const TextStyle(fontSize: 12, color: AppTheme.inkSoft, height: 1.5),
             ),
+
+            // 安全網觸發時，額外說明這次警示的可信度來源
+            // （面積門檻＝保守性規則 vs 膿液偵測＝組織訊號），
+            // 避免使用者把兩種不同可信度的紅色警示混為一談。
+            if (result.infectionSafetyNetTriggered && result.safetyNetReason != null) ...[
+              const SizedBox(height: 10),
+              _SafetyNetNotice(reason: result.safetyNetReason!),
+            ],
+
+            // 對應數據，讓使用者（或未來的醫師）能回頭核對是哪個
+            // 訊號觸發的判斷。
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+              decoration: const BoxDecoration(
+                border: Border(top: BorderSide(color: AppTheme.line)),
+              ),
+              child: Column(
+                children: [
+                  _dataRow('面積', '${areaCm2.toStringAsFixed(1)} cm²'),
+                  if (result.safetyNetReason == SafetyNetReason.pusDetected)
+                    _dataRow(
+                      '黃綠膿液比例',
+                      '${tissue.yellowGreenPusPct.toStringAsFixed(0)}%',
+                      danger: true,
+                    )
+                  else
+                    _dataRow(
+                      '黑+黃組織比例',
+                      '${(tissue.blackNecrosisPct + tissue.yellowSloughPct).toStringAsFixed(0)}%',
+                    ),
+                ],
+              ),
+            ),
+
             if (!usedRealModel) ...[
               const SizedBox(height: 10),
               Container(
@@ -221,6 +272,22 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
           ),
         ],
         actionsAlignment: MainAxisAlignment.center,
+      ),
+    );
+  }
+
+  Widget _dataRow(String label, String value, {bool danger = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(fontSize: 12, color: AppTheme.inkSoft)),
+          Text(
+            value,
+            style: AppTheme.mono(fontSize: 12, color: danger ? AppTheme.bad : AppTheme.ink),
+          ),
+        ],
       ),
     );
   }
@@ -257,6 +324,38 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               )
             : const Icon(Icons.camera),
         label: Text(_isProcessing ? '分析中...' : '拍照並判讀'),
+      ),
+    );
+  }
+}
+
+/// 安全網觸發原因說明條：面積門檻用琥珀色（保守性警示），
+/// 膿液偵測用紅色（真實組織訊號），讓使用者一眼分辨可信度來源。
+class _SafetyNetNotice extends StatelessWidget {
+  final SafetyNetReason reason;
+  const _SafetyNetNotice({required this.reason});
+
+  @override
+  Widget build(BuildContext context) {
+    final isPus = reason == SafetyNetReason.pusDetected;
+    final color = isPus ? AppTheme.bad : AppTheme.warn;
+    final bg = isPus ? AppTheme.badBg : AppTheme.warnBg;
+    final title = isPus ? '由組織分析判定' : '本次由安全網門檻觸發';
+    final detail = isPus
+        ? '偵測到黃綠膿液，判定為惡化警示。'
+        : '傷口絕對面積超過設定門檻，非組織比例分析判定，屬保守性警示。';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(10)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: color)),
+          const SizedBox(height: 2),
+          Text(detail, style: const TextStyle(fontSize: 11, color: AppTheme.inkSoft, height: 1.4)),
+        ],
       ),
     );
   }

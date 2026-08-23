@@ -22,6 +22,10 @@ class AreaCalculationService {
   }
 }
 
+/// 感染安全網觸發的具體原因，用來讓 UI 區分「保守性面積警示」
+/// 跟「偵測到膿液」這兩種可信度不同的觸發來源。
+enum SafetyNetReason { areaThreshold, pusDetected }
+
 /// 參考 PUSH Tool 概念設計的決策樹，整合面積變化 + 組織比例，
 /// 疊加感染安全網規則，輸出燈號建議。對應簡報 Step 6。
 ///
@@ -35,12 +39,18 @@ class DecisionService {
     required double? areaChangePct,
     required TissueComposition tissue,
   }) {
-    // 安全網規則：不論組織比例結果如何，面積超過門檻直接建議就醫
-    if (areaCm2 > _absoluteAreaAlertThresholdCm2 ||
-        tissue.yellowGreenPusPct > 0) {
-      return const DecisionResult(
+    final pusDetected = tissue.yellowGreenPusPct > 0;
+    final areaExceeded = areaCm2 > _absoluteAreaAlertThresholdCm2;
+
+    // 安全網規則：不論組織比例結果如何，面積超過門檻或偵測到膿液，
+    // 直接建議就醫。膿液是組織分析真的偵測到的訊號，優先視為該原因；
+    // 純粹只是面積超標（沒有膿液）才算是保守性安全網。
+    if (areaExceeded || pusDetected) {
+      final reason = pusDetected ? SafetyNetReason.pusDetected : SafetyNetReason.areaThreshold;
+      return DecisionResult(
         status: HealingStatus.deteriorating,
         infectionSafetyNetTriggered: true,
+        safetyNetReason: reason,
         advice: '感染風險高或傷口面積過大，建議尋求醫師清創評估',
       );
     }
@@ -77,10 +87,12 @@ class DecisionResult {
   final HealingStatus status;
   final String advice;
   final bool infectionSafetyNetTriggered;
+  final SafetyNetReason? safetyNetReason;
 
   const DecisionResult({
     required this.status,
     required this.advice,
     this.infectionSafetyNetTriggered = false,
+    this.safetyNetReason,
   });
 }

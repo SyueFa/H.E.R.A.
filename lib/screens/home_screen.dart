@@ -92,7 +92,7 @@ class _HomeScreenState extends State<HomeScreen> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _profiles.isEmpty
-              ? Center(
+              ? const Center(
                   child: Text(
                     '尚未建立傷口檔案，點右下角新增',
                     style: TextStyle(color: AppTheme.inkSoft, fontSize: 13),
@@ -123,7 +123,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               height: 48,
                               decoration: BoxDecoration(
                                 borderRadius: BorderRadius.circular(12),
-                                gradient: LinearGradient(
+                                gradient: const LinearGradient(
                                   begin: Alignment.topLeft,
                                   end: Alignment.bottomRight,
                                   colors: [AppTheme.tealPale, AppTheme.bluePale],
@@ -161,7 +161,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               const SizedBox(width: 4),
                             ],
                             IconButton(
-                              icon: Icon(Icons.show_chart, color: AppTheme.inkSoft, size: 20),
+                              icon: const Icon(Icons.show_chart, color: AppTheme.inkSoft, size: 20),
                               tooltip: '查看趨勢',
                               onPressed: () async {
                                 await Navigator.push(
@@ -174,7 +174,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               },
                             ),
                             IconButton(
-                              icon: Icon(Icons.camera_alt, color: AppTheme.blue, size: 20),
+                              icon: const Icon(Icons.camera_alt, color: AppTheme.blue, size: 20),
                               tooltip: '拍攝新紀錄',
                               onPressed: () async {
                                 await Navigator.push(

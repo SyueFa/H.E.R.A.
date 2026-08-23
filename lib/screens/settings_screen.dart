@@ -98,8 +98,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 24),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 4),
                   child: Text(
                     '關於',
                     style: TextStyle(fontSize: 12, color: AppTheme.inkSoft, fontWeight: FontWeight.w600),
