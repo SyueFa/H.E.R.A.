@@ -34,9 +34,16 @@ class DecisionService {
   // TODO: 這個絕對面積門檻要跟指導老師/資料確認合理值，目前先佔位
   static const double _absoluteAreaAlertThresholdCm2 = 25.0;
 
+  // 判定「停滯」的變化率門檻：變化幅度在 ±5% 內視為沒有明顯進展或惡化
+  static const double _stagnantChangePctThreshold = 5.0;
+
   DecisionResult decide({
     required double areaCm2,
     required double? areaChangePct,
+    // 上一筆紀錄「自己的」areaChangePct（也就是上一筆相對於它前一筆的變化率）。
+    // WoundRecord 儲存時本來就會存這個值，不需要額外查兩筆歷史紀錄，
+    // 直接把上一筆的這個欄位傳進來即可判斷「連續兩次」是否都停滯。
+    double? previousAreaChangePct,
     required TissueComposition tissue,
   }) {
     final pusDetected = tissue.yellowGreenPusPct > 0;
@@ -74,8 +81,26 @@ class DecisionService {
       );
     }
 
-    // 🟡 觀察：黃色腐肉 25%~50%，或面積連續停滯（±5% 內）
-    // TODO: 「連續兩週停滯」需要比對前兩次紀錄，目前先用單次資料簡化判斷
+    // 🟡 觀察：黃色腐肉 25%~50%，或「連續兩次」面積變化都在 ±5% 內
+    // （本次 vs 上次、上次 vs 上上次都要停滯，單次落在 ±5% 內不算數）。
+    final sloughInStagnantRange =
+        tissue.yellowSloughPct >= 25 && tissue.yellowSloughPct <= 50;
+
+    final currentStagnant =
+        areaChangePct != null && areaChangePct.abs() <= _stagnantChangePctThreshold;
+    final previousStagnant = previousAreaChangePct != null &&
+        previousAreaChangePct.abs() <= _stagnantChangePctThreshold;
+    final consecutiveStagnant = currentStagnant && previousStagnant;
+
+    if (sloughInStagnantRange || consecutiveStagnant) {
+      return const DecisionResult(
+        status: HealingStatus.stagnant,
+        advice: '復原停滯，加強滲出液控制與清潔',
+      );
+    }
+
+    // 其餘未落入任一明確規則的情況（例如組織比例中等、面積變化不上不下、
+    // 但還沒連續兩次停滯），先保守歸類為觀察，等資料更多再細分。
     return const DecisionResult(
       status: HealingStatus.stagnant,
       advice: '復原停滯，加強滲出液控制與清潔',

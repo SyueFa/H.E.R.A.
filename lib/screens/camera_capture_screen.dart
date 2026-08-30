@@ -45,6 +45,11 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
   bool _isProcessing = false;
   bool _modelLoaded = false;
+  // 桌機模擬器沒有實體鏡頭時，CameraX/availableCameras() 會直接拋錯。
+  // 這裡接住這個情況，讓畫面不會卡死，改顯示「模擬拍照」按鈕，
+  // 讓沒有 Webcam 的開發機也能測試後面的分析／燈號／資料庫流程。
+  bool _cameraUnavailable = false;
+  String? _cameraErrorMessage;
 
   @override
   void initState() {
@@ -53,13 +58,23 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   }
 
   Future<void> _initCamera() async {
-    final cameras = await availableCameras();
-    final backCamera = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => cameras.first,
-    );
-    _controller = CameraController(backCamera, ResolutionPreset.high);
-    await _controller!.initialize();
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        throw CameraException('noCamerasAvailable', '沒有偵測到任何相機裝置');
+      }
+      final backCamera = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      _controller = CameraController(backCamera, ResolutionPreset.high);
+      await _controller!.initialize();
+    } catch (e) {
+      // 常見於桌機模擬器（沒有實體 Webcam，或沒有正確設定虛擬相機）。
+      // 手機實機測試不會遇到這個分支，因為手機一定有相機。
+      _cameraUnavailable = true;
+      _cameraErrorMessage = e.toString();
+    }
 
     // 模型檔案還沒放進 assets/models/ 之前，loadModel() 一定會失敗，
     // 這裡刻意接住，讓相機還是能正常打開、拍照，只是分析階段會
@@ -77,48 +92,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   Future<void> _captureAndAnalyze() async {
     if (_controller == null || !_controller!.value.isInitialized) return;
     setState(() => _isProcessing = true);
-
     try {
       final file = await _controller!.takePicture();
-      final imageFile = File(file.path);
-
-      final previous = await widget.storage.getLatestRecord(widget.profile.id);
-
-      final (double areaCm2, TissueComposition tissue) =
-          await _analyzeImage(imageFile, previousAreaCm2: previous?.areaCm2);
-
-      final changePct = _area.areaChangePct(
-        previousAreaCm2: previous?.areaCm2,
-        currentAreaCm2: areaCm2,
-      );
-
-      final result = _decision.decide(
-        areaCm2: areaCm2,
-        areaChangePct: changePct,
-        tissue: tissue,
-      );
-
-      final record = WoundRecord(
-        id: DateTime.now().microsecondsSinceEpoch.toString(),
-        woundProfileId: widget.profile.id,
-        capturedAt: DateTime.now(),
-        imagePath: imageFile.path,
-        areaCm2: areaCm2,
-        areaChangePct: changePct,
-        tissue: tissue,
-        status: result.status,
-        infectionSafetyNetTriggered: result.infectionSafetyNetTriggered,
-      );
-      await widget.storage.saveRecord(record);
-
-      if (mounted) {
-        _showResultDialog(
-          result,
-          areaCm2: areaCm2,
-          tissue: tissue,
-          usedRealModel: _modelLoaded,
-        );
-      }
+      await _runAnalysisPipeline(imagePath: file.path);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -130,14 +106,83 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     }
   }
 
+  /// 沒有實體相機（例如桌機模擬器）時的替代路徑：跳過真的拍照，
+  /// 直接用一個佔位路徑走完「分析 → 決策 → 存檔 → 顯示結果」流程。
+  /// 因為目前分析邏輯本來就是走示範資料 fallback，不看照片實際內容，
+  /// 所以這條路徑產生的紀錄跟真的拍照產生的紀錄，在資料庫裡是等價的，
+  /// 適合用來驗證燈號判定、連續停滯邏輯、趨勢圖等跟相機無關的功能。
+  Future<void> _simulateAndAnalyze() async {
+    setState(() => _isProcessing = true);
+    try {
+      final placeholderPath =
+          'mock_no_camera_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      await _runAnalysisPipeline(imagePath: placeholderPath);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('分析失敗：$e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  /// 拍照／模擬拍照共用的後續流程：分析 → 決策 → 存檔 → 顯示結果彈窗。
+  Future<void> _runAnalysisPipeline({required String imagePath}) async {
+    final previous = await widget.storage.getLatestRecord(widget.profile.id);
+
+    final (double areaCm2, TissueComposition tissue) = await _analyzeImage(
+      imagePath.startsWith('mock_') ? null : File(imagePath),
+      previousAreaCm2: previous?.areaCm2,
+    );
+
+    final changePct = _area.areaChangePct(
+      previousAreaCm2: previous?.areaCm2,
+      currentAreaCm2: areaCm2,
+    );
+
+    final result = _decision.decide(
+      areaCm2: areaCm2,
+      areaChangePct: changePct,
+      // previous 這筆紀錄自己的 areaChangePct，就是「上次 vs 上上次」的
+      // 變化率，跟這次算出的 changePct 合在一起，才能判斷連續兩次是否
+      // 都落在停滯門檻內。
+      previousAreaChangePct: previous?.areaChangePct,
+      tissue: tissue,
+    );
+
+    final record = WoundRecord(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      woundProfileId: widget.profile.id,
+      capturedAt: DateTime.now(),
+      imagePath: imagePath,
+      areaCm2: areaCm2,
+      areaChangePct: changePct,
+      tissue: tissue,
+      status: result.status,
+      infectionSafetyNetTriggered: result.infectionSafetyNetTriggered,
+    );
+    await widget.storage.saveRecord(record);
+
+    if (mounted) {
+      _showResultDialog(
+        result,
+        areaCm2: areaCm2,
+        tissue: tissue,
+        usedRealModel: _modelLoaded,
+      );
+    }
+  }
+
   /// 真正的模型接上後，這裡會走 YOLO 分割 + HSV 分析；
   /// 模型還沒到手（或載入/推論失敗）時，退回一組隨機但合理的
   /// 示範資料，讓後面的決策樹、彈窗、資料庫、趨勢圖都能真實跑一遍。
   Future<(double, TissueComposition)> _analyzeImage(
-    File imageFile, {
+    File? imageFile, {
     double? previousAreaCm2,
   }) async {
-    if (_modelLoaded) {
+    if (_modelLoaded && imageFile != null) {
       try {
         // Step 2: 邊界分割
         // ignore: unused_local_variable
@@ -302,6 +347,64 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
+
+    // 相機初始化失敗（常見於桌機模擬器沒有 Webcam）：
+    // 顯示說明文字＋「模擬拍照」按鈕，讓其餘功能還是能測試。
+    if (_cameraUnavailable) {
+      return Scaffold(
+        appBar: AppBar(title: Text('拍攝：${widget.profile.label}')),
+        body: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.videocam_off, size: 48, color: AppTheme.inkSoft),
+                const SizedBox(height: 12),
+                const Text(
+                  '偵測不到相機\n（開發測試用：可能是模擬器沒有接 Webcam，\n或這台電腦沒有鏡頭）',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 13, color: AppTheme.inkSoft, height: 1.6),
+                ),
+                if (_cameraErrorMessage != null) ...[
+                  const SizedBox(height: 6),
+                  // 完整錯誤訊息可能很長，限制高度並可獨立捲動查看，
+                  // 避免把整個畫面撐爆造成 overflow。
+                  Container(
+                    constraints: const BoxConstraints(maxHeight: 120),
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: AppTheme.bg,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: SingleChildScrollView(
+                      child: Text(
+                        _cameraErrorMessage!,
+                        style: AppTheme.mono(fontSize: 9, color: AppTheme.inkSoft),
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 20),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: AppTheme.blue),
+                  onPressed: _isProcessing ? null : _simulateAndAnalyze,
+                  icon: _isProcessing
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                        )
+                      : const Icon(Icons.science_outlined),
+                  label: Text(_isProcessing ? '分析中...' : '模擬拍照並判讀（測試用）'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(title: Text('拍攝：${widget.profile.label}')),
       body: controller == null || !controller.value.isInitialized
